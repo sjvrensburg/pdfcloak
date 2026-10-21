@@ -1,0 +1,26 @@
+[package]
+name = "clipcloak-server"
+version = "0.6.0"
+edition = "2021"
+license = "MIT"
+
+[lib]
+name = "clipcloak_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "clipcloak-server"
+path = "src/main.rs"
+
+[dependencies]
+gliner2_inference = { path = "vendor-gliner2-rs" }
+tiny_http = "0.12"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+regex = "1"
+ort = { version = "=2.0.0-rc.13", default-features = false, features = ["load-dynamic"] }
+ort-sys = "=2.0.0-rc.13"
+
+[profile.release]
+opt-level = 3

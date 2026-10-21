@@ -1,0 +1,58 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pdfcloak"
+version = "0.1.0"
+description = "CLI tool that redacts PII from PDF documents (regex + on-device GLiNER2 via a vendored ClipCloak sidecar)"
+readme = "README.md"
+license = "AGPL-3.0-or-later"
+requires-python = ">=3.11"
+authors = [{ name = "Stefan van Rensburg" }]
+keywords = ["pdf", "redaction", "pii", "privacy", "gliner", "onnx"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+    "Topic :: Text Processing",
+]
+dependencies = [
+    "pymupdf>=1.24,<3",
+    "regex>=2024.5.15",
+]
+
+[project.optional-dependencies]
+onnx = ["onnxruntime>=1.18", "tokenizers>=0.19"]
+
+[dependency-groups]
+dev = ["pytest>=8", "reportlab>=4"]
+
+[project.scripts]
+pdfcloak = "pdfcloak.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pdfcloak"]
+
+# Bundle the vendored Rust sidecar *sources* in the wheel (~300 KB) so an
+# installed tool can build its own binary with `pdfcloak sidecar build`.
+# The 11 MB binary and 412 MB model weights are deliberately not in the wheel.
+[tool.hatch.build.targets.wheel.force-include]
+"vendor/clipcloak-server/Cargo.toml" = "pdfcloak/_sidecar/Cargo.toml"
+"vendor/clipcloak-server/Cargo.lock" = "pdfcloak/_sidecar/Cargo.lock"
+"vendor/clipcloak-server/src/lib.rs" = "pdfcloak/_sidecar/src/lib.rs"
+"vendor/clipcloak-server/src/main.rs" = "pdfcloak/_sidecar/src/main.rs"
+"vendor/clipcloak-server/vendor-gliner2-rs/Cargo.toml" = "pdfcloak/_sidecar/vendor-gliner2-rs/Cargo.toml"
+"vendor/clipcloak-server/vendor-gliner2-rs/Cargo.lock" = "pdfcloak/_sidecar/vendor-gliner2-rs/Cargo.lock"
+"vendor/clipcloak-server/vendor-gliner2-rs/src/error.rs" = "pdfcloak/_sidecar/vendor-gliner2-rs/src/error.rs"
+"vendor/clipcloak-server/vendor-gliner2-rs/src/lib.rs" = "pdfcloak/_sidecar/vendor-gliner2-rs/src/lib.rs"
+"vendor/clipcloak-server/vendor-gliner2-rs/src/lib_v2.rs" = "pdfcloak/_sidecar/vendor-gliner2-rs/src/lib_v2.rs"
+"vendor/clipcloak-server/vendor-gliner2-rs/src/processor.rs" = "pdfcloak/_sidecar/vendor-gliner2-rs/src/processor.rs"
+"vendor/clipcloak-server/UPSTREAM.md" = "pdfcloak/_sidecar/UPSTREAM.md"
+"vendor/clipcloak-server/LICENSE.clipcloak-MIT" = "pdfcloak/_sidecar/LICENSE.clipcloak-MIT"
+"vendor/clipcloak-server/vendor-gliner2-rs/LICENSE" = "pdfcloak/_sidecar/vendor-gliner2-rs/LICENSE"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
