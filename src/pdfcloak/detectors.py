@@ -87,14 +87,69 @@ def _reconcile(text: str, start: int, end: int, expected: str) -> tuple[int, int
     return nearest, nearest + len(expected)
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _validate_sidecar_url(base_url: str, token: str | None) -> str:
+    """Refuse to spray page text + Bearer [REDACTED] at an arbitrary URL.
+
+    Loopback http is fine (that is the local sidecar). Anything else needs
+    https, and a token over plain http to a remote host is always refused.
+    Set PDFCLOAK_ALLOW_REMOTE_SIDECAR=1 to explicitly trust a remote https
+    endpoint.
+    """
+    import os
+    import urllib.parse
+
+    url = base_url.rstrip("/")
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https") or not parsed.hostname:
+        raise PdfCloakError(f"--sidecar-url must be an http(s) URL, got {base_url!r}")
+    host = parsed.hostname.lower()
+    if host in _LOOPBACK_HOSTS:
+        return url
+    if parsed.scheme != "https":
+        raise PdfCloakError(
+            f"--sidecar-url {base_url!r} is not loopback; refusing to send "
+            "page text (and any Bearer [REDACTED]) over plain http — use https")
+    if os.environ.get("PDFCLOAK_ALLOW_REMOTE_SIDECAR") != "1":
+        raise PdfCloakError(
+            f"--sidecar-url {base_url!r} is a remote endpoint; page text would "
+            "leave this machine. Set PDFCLOAK_ALLOW_REMOTE_SIDECAR=1 to trust it")
+    return url
+
+
+_CHUNK_OVERLAP = 512  # chars; an entity straddling a cut must appear whole
+# in at least one chunk (entities longer than this are pathological).
+
+
+def _text_chunks(text: str, max_bytes: int = 35_000) -> list[tuple[int, str]]:
+    """Split text into overlapping (char_offset, chunk) under the 40k cap."""
+    if len(text.encode("utf-8", "ignore")) <= max_bytes:
+        return [(0, text)]
+    chunks: list[tuple[int, str]] = []
+    start, size = 0, 0
+    for i, ch in enumerate(text):
+        size += len(ch.encode("utf-8", "ignore"))
+        if size > max_bytes and i > start:
+            chunks.append((start, text[start:i]))
+            start = max(start, i - _CHUNK_OVERLAP)
+            size = len(text[start:i].encode("utf-8", "ignore"))
+    chunks.append((start, text[start:]))
+    return chunks
+
+
 class ClipCloakDetector:
     """HTTP client for the vendored ClipCloak daemon (Option 2 sidecar)."""
 
     name = "clipcloak"
 
-    def __init__(self, base_url: str, token: str | None = None):
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, base_url: str, token: str | None = None, *,
+                 timeout: float = 600.0, retries: int = 2):
+        self.base_url = _validate_sidecar_url(base_url, token)
         self.token = token
+        self.timeout = timeout
+        self.retries = retries
 
     def health(self, timeout: float = 5.0) -> bool:
         try:
@@ -110,7 +165,8 @@ class ClipCloakDetector:
 
         Plain /health is identity-free, so anything that grabbed the port
         could answer it. /identity requires the bearer token and names the
-        service. Older daemons without /identity fall back to /health.
+        service. Fail closed: a daemon without /identity (404) is not
+        trusted — a /health fallback lets a port-squatter impersonate it.
         """
         req = urllib.request.Request(
             f"{self.base_url}/identity",
@@ -120,50 +176,96 @@ class ClipCloakDetector:
                 if r.status != 200:
                     return False
                 return json.loads(r.read().decode("utf-8")).get("service") == "clipcloak"
-        except urllib.error.HTTPError as exc:
-            if exc.code == 404:
-                return self.health(timeout)
+        except (urllib.error.HTTPError, urllib.error.URLError, OSError, ValueError):
             return False
-        except (urllib.error.URLError, OSError, ValueError):
-            return False
+
+    def _classify(self, text: str, *, page: int, threshold: float) -> dict:
+        """One /classify POST with bounded retries on transient failures."""
+        import time
+        body = json.dumps({"text": text, "threshold": threshold}).encode()
+        last_exc: Exception | None = None
+        for attempt in range(self.retries + 1):
+            req = urllib.request.Request(
+                f"{self.base_url}/classify", data=body,
+                headers={"Content-Type": "application/json",
+                         **({"Authorization": f"Bearer {self.token}"} if self.token else {})},
+                method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                    payload = json.loads(r.read().decode("utf-8"))
+                if not isinstance(payload, dict):
+                    raise PdfCloakError("ClipCloak sidecar returned a non-object response")
+                return payload
+            except urllib.error.HTTPError as exc:
+                detail = ""
+                try:
+                    detail = exc.read().decode("utf-8", "replace")[:500]
+                except Exception:
+                    pass
+                if exc.code < 500 or attempt >= self.retries:
+                    raise PdfCloakError(
+                        f"ClipCloak sidecar HTTP {exc.code} on page {page + 1}"
+                        + (f": {detail}" if detail else "")) from None
+                last_exc = exc
+            except (urllib.error.URLError, OSError) as exc:
+                last_exc = exc
+                if attempt >= self.retries:
+                    break
+            except ValueError as exc:
+                raise PdfCloakError(
+                    f"ClipCloak sidecar returned invalid JSON on page {page + 1}") from exc
+            time.sleep(0.2 * (attempt + 1))
+        raise PdfCloakError(
+            f"ClipCloak sidecar unreachable ({last_exc}); is it running?") from None
 
     def detect(self, text: str, *, page: int, labels: list[str], threshold: float) -> list[Span]:
-        body = json.dumps({"text": text, "threshold": threshold}).encode()
-        req = urllib.request.Request(
-            f"{self.base_url}/classify", data=body,
-            headers={"Content-Type": "application/json",
-                     **({"Authorization": f"Bearer {self.token}"} if self.token else {})},
-            method="POST")
-        try:
-            with urllib.request.urlopen(req, timeout=600) as r:
-                payload = json.loads(r.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            raise PdfCloakError(f"ClipCloak sidecar HTTP {exc.code} on page {page + 1}") from None
-        except (urllib.error.URLError, OSError, ValueError) as exc:
-            raise PdfCloakError(
-                f"ClipCloak sidecar unreachable or bad response ({exc}); is it running?") from None
-        if not isinstance(payload, dict):
-            raise PdfCloakError("ClipCloak sidecar returned a non-object response")
         wanted = set(labels)
         spans: list[Span] = []
-        for ent in payload.get("entities", []):
-            if not isinstance(ent, dict):
-                continue
-            label = str(ent.get("label", ""))
-            if wanted and label not in wanted:
-                continue
-            expected = str(ent.get("text", ""))
-            try:
-                fixed = _reconcile(text, int(ent.get("start", 0)),
-                                   int(ent.get("end", 0)), expected)
-                score = float(ent.get("score", 0.0))
-            except (TypeError, ValueError):
-                continue
-            if fixed is None:
-                continue
-            spans.append(Span(page, fixed[0], fixed[1], label, score, self.name, expected))
-        return spans
-
+        dropped = 0
+        for offset, chunk in _text_chunks(text):
+            payload = self._classify(chunk, page=page, threshold=threshold)
+            if "entities" not in payload:
+                raise PdfCloakError(
+                    "ClipCloak sidecar response has no 'entities' key; "
+                    "refusing to report this page clean")
+            entities = payload["entities"]
+            if not isinstance(entities, list):
+                raise PdfCloakError("ClipCloak sidecar returned a non-list 'entities'")
+            for ent in entities:
+                # Fail closed: silently skipping a malformed entity could
+                # be the PII that makes this page report clean.
+                if not isinstance(ent, dict):
+                    dropped += 1
+                    continue
+                label = str(ent.get("label", ""))
+                if wanted and label not in wanted:
+                    continue
+                expected = str(ent.get("text", ""))
+                try:
+                    fixed = _reconcile(chunk, int(ent.get("start", 0)),
+                                       int(ent.get("end", 0)), expected)
+                    score = float(ent.get("score", 0.0))
+                except (TypeError, ValueError):
+                    dropped += 1
+                    continue
+                if fixed is None or not label or not expected:
+                    dropped += 1
+                    continue
+                spans.append(Span(page, offset + fixed[0], offset + fixed[1],
+                                  label, score, self.name, expected))
+        if dropped:
+            raise PdfCloakError(
+                f"ClipCloak sidecar returned {dropped} malformed entit(ies) on "
+                f"page {page + 1}; refusing to report this page clean")
+        # Overlapping chunks can report the same entity twice.
+        seen: set[tuple[int, int, str]] = set()
+        unique: list[Span] = []
+        for s in spans:
+            key = (s.start, s.end, s.label)
+            if key not in seen:
+                seen.add(key)
+                unique.append(s)
+        return unique
 
 class OnnxDetector:
     """Generic single-graph token-classification ONNX model.
@@ -189,10 +291,18 @@ class OnnxDetector:
             raise PdfCloakError(f"{d} must contain an .onnx file and tokenizer.json")
         import onnxruntime as ort
         from tokenizers import Tokenizer
-        self.session = ort.InferenceSession(str(models[0]), providers=["CPUExecutionProvider"])
-        self.tokenizer = Tokenizer.from_file(str(d / "tokenizer.json"))
+        try:
+            self.session = ort.InferenceSession(str(models[0]), providers=["CPUExecutionProvider"])
+            self.tokenizer = Tokenizer.from_file(str(d / "tokenizer.json"))
+        except Exception as exc:
+            raise PdfCloakError(f"cannot load ONNX model in {d}: {exc}") from None
         self.tokenizer.no_truncation()
-        config = json.loads((d / "config.json").read_text()) if (d / "config.json").exists() else {}
+        try:
+            config = json.loads((d / "config.json").read_text()) if (d / "config.json").exists() else {}
+        except (OSError, ValueError) as exc:
+            raise PdfCloakError(f"invalid config.json in {d}: {exc}") from None
+        if not isinstance(config, dict):
+            raise PdfCloakError(f"config.json in {d} must contain a JSON object")
         self.id2label: dict[int, str] = {
             int(k): v for k, v in config.get("id2label", {}).items()}
         self.input_names = [i.name for i in self.session.get_inputs()]

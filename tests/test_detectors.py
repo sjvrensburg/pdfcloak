@@ -32,7 +32,9 @@ def test_overlap_regex_beats_model():
 def test_clipcloak_detector_against_fake_sidecar():
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
-            self.send_response(200); self.end_headers(); self.wfile.write(b'{"ok":true}')
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"ok":true}')
 
         def do_POST(self):
             length = int(self.headers["Content-Length"])
@@ -47,7 +49,8 @@ def test_clipcloak_detector_against_fake_sidecar():
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(data)))
-            self.end_headers(); self.wfile.write(data)
+            self.end_headers()
+            self.wfile.write(data)
 
         def log_message(self, *a):
             pass

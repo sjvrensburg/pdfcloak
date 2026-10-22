@@ -24,8 +24,12 @@ jobs:
         run: uv python install ${{ matrix.python-version }}
       - name: Install dependencies
         run: uv sync --group dev --python ${{ matrix.python-version }} --frozen
+      - name: Lint
+        run: uv run --frozen --python ${{ matrix.python-version }} ruff check src tests
+      - name: Typecheck
+        run: uv run --frozen --python ${{ matrix.python-version }} mypy src/pdfcloak
       - name: Run tests
-        run: uv run --python ${{ matrix.python-version }} pytest -q
+        run: uv run --frozen --python ${{ matrix.python-version }} pytest -q --cov=pdfcloak --cov-fail-under=75
       - name: Build distributions
         if: matrix.python-version == '3.12'
         run: uv build

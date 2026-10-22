@@ -2,7 +2,30 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
+import os
 from dataclasses import dataclass, field
+
+
+def masked_text(text: str) -> str:
+    """Redacted glimpse of a match, safe to show without --show-matches.
+
+    Keeps only enough shape to recognise the hit (``j***@e***.com``,
+    ``+***4``) so a reviewer can triage scan -> redact without printing PII.
+    """
+    if not text:
+        return ""
+    if "@" in text and "." in text.rsplit("@", 1)[-1]:
+        local, _, domain = text.partition("@")
+        host, _, tld = domain.rpartition(".")
+        # Short local/host parts would be fully reconstructable from the
+        # first-letter glimpse, so mask them entirely.
+        if len(local) <= 2 or len(host) <= 2:
+            return "***"
+        return f"{local[:1]}***@{host[:1]}***.{tld}"
+    if len(text) <= 8:
+        return "***"
+    return f"{text[:1]}***{text[-1:]}"
 
 
 @dataclass(frozen=True)
@@ -19,21 +42,42 @@ class Span:
     def length(self) -> int:
         return self.end - self.start
 
+    @property
+    def is_rule(self) -> bool:
+        return self.source == "regex" or self.score >= 2.0
+
     def digest(self) -> str:
-        """Short hash for audit reports (never log raw PII by default)."""
-        return hashlib.sha256(self.text.encode("utf-8", "replace")).hexdigest()[:12]
+        """Short hash for audit reports (never log raw PII by default).
+
+        An unsalted SHA-256 of low-entropy PII (emails, phone numbers) is
+        guess-confirmable offline, so when PDFCLOAK_REPORT_HMAC_KEY is set
+        the digest is keyed HMAC instead.
+        """
+        key = os.environ.get("PDFCLOAK_REPORT_HMAC_KEY")
+        data = self.text.encode("utf-8", "replace")
+        if key:
+            return hmac.new(key.encode(), data, hashlib.sha256).hexdigest()[:12]
+        return hashlib.sha256(data).hexdigest()[:12]
 
     def report_entry(self, *, show_text: bool = False) -> dict:
         entry: dict = {
             "page": self.page + 1 if self.page >= 0 else None,
             "label": self.label,
-            "score": round(self.score, 4),
+            # Regex rules carry a sentinel score of 2.0 (priority, not
+            # confidence); reporting it beside 0-1 model scores reads as
+            # >100% confidence, so rules report score:null + priority.
+            "score": None if self.is_rule else round(self.score, 4),
+            "priority": "rule" if self.is_rule else "model",
             "source": self.source,
             "start": self.start,
             "end": self.end,
             "length": self.length,
-            "sha256": self.digest(),
+            "masked_text": masked_text(self.text),
         }
+        # Only emit a digest when it is keyed: an unsalted hash of an
+        # email/phone number can be confirmed by guessing offline.
+        if os.environ.get("PDFCLOAK_REPORT_HMAC_KEY"):
+            entry["digest"] = self.digest()
         if show_text:
             entry["text"] = self.text
         return entry
