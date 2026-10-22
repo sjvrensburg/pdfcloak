@@ -1,6 +1,8 @@
 """Page-range parsing. Specs are 1-based and inclusive (see report §4)."""
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 from . import PdfCloakError
 
 
@@ -38,6 +40,7 @@ def parse_page_spec(spec: str | None, page_count: int) -> list[int]:
         if part == "-":
             raise PdfCloakError(
                 f"bare '-' is not a page spec in --pages {spec!r} (use 'all' or '-N')")
+        candidates: Iterable[int]
         if "-" in part[1:] or (part.startswith("-") and len(part) > 1) or part.endswith("-"):
             left, _, right = part.partition("-")
             lo = endpoint(left, is_end=False) if left.strip() else 1

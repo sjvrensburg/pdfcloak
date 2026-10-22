@@ -397,6 +397,25 @@ fn push_subspan(
     });
 }
 
+/// Token comparison without length/timing leaks: both sides are hashed
+/// to a fixed-size digest first, then compared in constant time.
+fn token_matches(provided: Option<&str>, expected: &str) -> bool {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::Hasher;
+    let Some(provided) = provided else { return false };
+    let digest = |s: &str| {
+        let mut h = DefaultHasher::new();
+        h.write(s.as_bytes());
+        h.finish().to_be_bytes()
+    };
+    let (a, b) = (digest(provided), digest(expected));
+    let mut diff = 0u8;
+    for i in 0..a.len() {
+        diff |= a[i] ^ b[i];
+    }
+    diff == 0
+}
+
 fn header(k: &str, v: &str) -> Header {
     Header::from_bytes(k.as_bytes(), v.as_bytes()).unwrap()
 }
@@ -498,29 +517,62 @@ impl Server {
     /// Serve with an already-loaded engine (lets the GUI show "model ready"
     /// before binding, and reuse the engine across port restarts).
     pub fn serve(&self, engine: Gliner2Engine) -> anyhow::Result<()> {
-        let server = HttpServer::http(("127.0.0.1", self.config.port))
-            .map_err(|e| anyhow::anyhow!("bind 127.0.0.1:{}: {e}", self.config.port))?;
+        let server = Arc::new(
+            HttpServer::http(("127.0.0.1", self.config.port))
+                .map_err(|e| anyhow::anyhow!("bind 127.0.0.1:{}: {e}", self.config.port))?,
+        );
         eprintln!("Listening on http://127.0.0.1:{}", self.config.port);
-
-        loop {
-            if self.shutdown.load(Ordering::Relaxed) {
-                eprintln!("Shutdown requested; stopping server.");
-                return Ok(());
+        // Worker pool: /health and /identity are answered without touching
+        // the engine lock, so probes stay responsive while a (serialized)
+        // inference is in flight instead of timing out behind it.
+        let engine = Arc::new(std::sync::Mutex::new(engine));
+        let (tx, rx) = std::sync::mpsc::channel::<tiny_http::Request>();
+        let rx = Arc::new(std::sync::Mutex::new(rx));
+        std::thread::scope(|scope| {
+            // Single inference worker: owns every /classify request.
+            {
+                let rx = Arc::clone(&rx);
+                let engine = Arc::clone(&engine);
+                scope.spawn(move || loop {
+                    if self.shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    match rx.lock().unwrap().recv_timeout(Duration::from_millis(250)) {
+                        Ok(req) => self.handle(req, &engine),
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                        Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                    }
+                });
             }
-            // Poll so an idle server still notices the shutdown flag.
-            let request = match server.recv_timeout(Duration::from_millis(250)) {
-                Ok(Some(req)) => req,
-                Ok(None) => continue,
-                Err(e) => {
-                    eprintln!("recv error: {e}");
-                    continue;
-                }
-            };
-            self.handle(request, &engine);
-        }
+            // Receivers: probes answered inline; classify forwarded.
+            for _ in 0..4 {
+                let server = Arc::clone(&server);
+                let engine = Arc::clone(&engine);
+                let tx = tx.clone();
+                scope.spawn(move || loop {
+                    if self.shutdown.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    // Poll so an idle server still notices the shutdown flag.
+                    match server.recv_timeout(Duration::from_millis(250)) {
+                        Ok(Some(req)) => {
+                            if req.method() == &Method::Post && req.url() == "/classify" {
+                                let _ = tx.send(req);
+                            } else {
+                                self.handle(req, &engine)
+                            }
+                        }
+                        Ok(None) => continue,
+                        Err(e) => eprintln!("recv error: {e}"),
+                    }
+                });
+            }
+        });
+        eprintln!("Shutdown requested; stopping server.");
+        Ok(())
     }
 
-    fn handle(&self, mut request: tiny_http::Request, engine: &Gliner2Engine) {
+    fn handle(&self, mut request: tiny_http::Request, engine: &std::sync::Mutex<Gliner2Engine>) {
         let method = request.method().clone();
         let url = request.url().to_string();
 
@@ -550,15 +602,20 @@ impl Server {
         // (and not a foreign process that grabbed the port) before sending PII.
         if method == Method::Get && url == "/identity" {
             let expected = self.state.read().unwrap().token.clone();
+            // No token configured = documented unauthenticated dev mode
+            // (main.rs warns about it). pdfcloak's spawned sidecar always
+            // sets a token, so its identity check stays fail-closed.
             let ok = match &expected {
                 None => true,
-                Some(token) => request
-                    .headers()
-                    .iter()
-                    .find(|h| h.field.equiv("Authorization"))
-                    .map(|h| h.value.as_str())
-                    .and_then(|s| s.strip_prefix("Bearer "))
-                    == Some(token.as_str()),
+                Some(token) => token_matches(
+                    request
+                        .headers()
+                        .iter()
+                        .find(|h| h.field.equiv("Authorization"))
+                        .map(|h| h.value.as_str())
+                        .and_then(|s| s.strip_prefix("Bearer ")),
+                    token,
+                ),
             };
             let (code, body) = if ok {
                 (200, "{\"service\":\"clipcloak\",\"ok\":true}")
@@ -580,18 +637,19 @@ impl Server {
             (s.token.clone(), s.labels.clone(), s.threshold, s.rules.clone())
         };
 
-        if let Some(expected) = &token {
-            let ok = request
-                .headers()
-                .iter()
-                .find(|h| h.field.equiv("Authorization"))
-                .map(|h| h.value.as_str())
-                .and_then(|s| s.strip_prefix("Bearer "))
-                == Some(expected.as_str());
-            if !ok {
-                let _ = request.respond(json_response(401, "{\"error\":\"invalid token\"}", allow_origin));
-                return;
-            }
+        let provided = request
+            .headers()
+            .iter()
+            .find(|h| h.field.equiv("Authorization"))
+            .map(|h| h.value.as_str())
+            .and_then(|s| s.strip_prefix("Bearer "));
+        let authorized = match &token {
+            Some(expected) => token_matches(provided, expected),
+            None => true, // tokenless dev mode; see identity handler
+        };
+        if !authorized {
+            let _ = request.respond(json_response(401, "{\"error\":\"invalid token\"}", allow_origin));
+            return;
         }
 
         // pdfcloak fix: cap the read — upstream read the whole body into
@@ -629,6 +687,13 @@ impl Server {
         let wins = windows(&req.text);
         let parts = wins.len();
         let mut pooled: Vec<ExtractedEntity> = Vec::new();
+        let engine = match engine.lock() {
+            Ok(g) => g,
+            Err(_) => {
+                let _ = request.respond(json_response(500, "{\"error\":\"engine unavailable\"}", allow_origin));
+                return;
+            }
+        };
         for (offset, window) in wins {
             let params = InferenceParams { threshold, flat_ner: true };
             match engine.extract(window, &tasks, Some(params)) {
@@ -645,6 +710,8 @@ impl Server {
                 }
             }
         }
+
+        drop(engine);
 
         // Resolve model spans against user regex matches. Rules take precedence,
         // but only over the bytes they cover — a partial overlap keeps the model
@@ -746,6 +813,15 @@ mod tests {
         let keep = ents.iter().filter(|e| e.label == "Keep").count();
         assert_eq!(broad, MAX_MATCHES_PER_RULE); // capped
         assert_eq!(keep, 1); // still ran despite the earlier rule saturating
+    }
+
+    #[test]
+    fn token_matches_is_exact() {
+        assert!(token_matches(Some("s3cret"), "s3cret"));
+        assert!(!token_matches(Some("s3cre"), "s3cret"));
+        assert!(!token_matches(Some("s3cretX"), "s3cret"));
+        assert!(!token_matches(None, "s3cret"));
+        assert!(!token_matches(Some(""), "s3cret"));
     }
 
     #[test]

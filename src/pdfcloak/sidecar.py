@@ -8,6 +8,8 @@ they are fetched from Hugging Face on first run unless PII_MODELS_DIR is set.
 from __future__ import annotations
 
 import atexit
+import collections
+import hashlib
 import os
 import secrets
 import socket
@@ -80,11 +82,27 @@ def build_sidecar(*, force: bool = False) -> Path:
         shutil.rmtree(build_dir)
     shutil.copytree(sources, build_dir,
                     ignore=shutil.ignore_patterns("target", "__pycache__"))
-    proc = subprocess.run([cargo, "build", "--release", "--locked"], cwd=build_dir,
-                          capture_output=True, text=True)
+    print("building sidecar (cargo, may take a few minutes) ...", file=sys.stderr)
+    # Own process group so a timeout kills cargo *and* its rustc children,
+    # and partial output survives for diagnosis.
+    proc = subprocess.Popen([cargo, "build", "--release", "--locked"], cwd=build_dir,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, start_new_session=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=1800)
+    except subprocess.TimeoutExpired:
+        import signal
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            proc.kill()
+        stdout, stderr = proc.communicate()
+        raise PdfCloakError(
+            "cargo build timed out after 1800s; last output:\n"
+            f"{(stdout or '')[-1000:]}\n{(stderr or '')[-1000:]}") from None
     if proc.returncode != 0:
         raise PdfCloakError(
-            f"cargo build failed:\n{proc.stdout[-2000:]}\n{proc.stderr[-2000:]}")
+            f"cargo build failed:\n{stdout[-2000:]}\n{stderr[-2000:]}")
     built = build_dir / "target" / "release" / _binary_name()
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(built, dest)
@@ -164,6 +182,13 @@ class Sidecar:
         self.detector = ClipCloakDetector(f"http://127.0.0.1:{self.port}", self.token)
 
     def __enter__(self) -> ClipCloakDetector:
+        expected_hash = os.environ.get("PDFCLOAK_SIDECAR_SHA256")
+        if expected_hash and self.binary is not None:
+            actual = hashlib.sha256(Path(self.binary).read_bytes()).hexdigest()
+            if actual.lower() != expected_hash.lower():
+                raise PdfCloakError(
+                    f"sidecar binary hash mismatch: got {actual}, "
+                    f"expected {expected_hash} (PDFCLOAK_SIDECAR_SHA256)")
         if self.binary is None:
             raise PdfCloakError(
                 "ClipCloak sidecar binary not found. Build it once with "
@@ -175,7 +200,7 @@ class Sidecar:
             "PII_TOKEN": self.token,
             "PII_LABELS": ",".join(self.labels),
             "PII_THRESHOLD": str(self.threshold),
-            "PII_ALLOWED_ORIGINS": "*",
+            "PII_ALLOWED_ORIGINS": "",
         })
         if self.models_dir:
             env["PII_MODELS_DIR"] = str(self.models_dir)
@@ -183,7 +208,7 @@ class Sidecar:
         if ort_lib:
             env["ORT_DYLIB_PATH"] = ort_lib
         self._log_handle = open(self.log_file, "ab") if self.log_file else None
-        self._output: list[str] = []
+        self._output: collections.deque[str] = collections.deque(maxlen=200)
         self._listening = threading.Event()
         try:
             self.proc = subprocess.Popen(
@@ -196,7 +221,7 @@ class Sidecar:
                 if self.proc.poll() is not None:
                     raise PdfCloakError(
                         f"sidecar exited early (code {self.proc.returncode}): "
-                        + " | ".join(self._output[-3:]))
+                        + " | ".join(list(self._output)[-3:]))
                 # Only trust the port once *our child* says it is listening,
                 # and only after its authenticated identity check passes —
                 # a foreign process that grabbed the port cannot satisfy both.
@@ -224,6 +249,10 @@ class Sidecar:
                     self._log_handle.flush()
                 except OSError:
                     pass
+            elif line:
+                # Surface startup/download progress: a silent 600s wait for
+                # a 412 MB model download otherwise looks like a hang.
+                print(f"sidecar: {line}", file=sys.stderr)
 
     def stop(self) -> None:
         atexit.unregister(self.stop)
@@ -244,3 +273,32 @@ class Sidecar:
 
     def __exit__(self, *exc) -> None:
         self.stop()
+
+
+def model_cache_present() -> bool:
+    """Best-effort check that GLiNER2 weights are already downloaded."""
+    import os as _os
+    models_dir = _os.environ.get("PII_MODELS_DIR")
+    if models_dir:
+        return Path(models_dir).is_dir()
+    hub = Path(_os.environ.get("HF_HOME") or Path.home() / ".cache" / "huggingface") / "hub"
+    try:
+        return hub.is_dir() and any("gliner" in entry.name.lower() for entry in hub.iterdir())
+    except OSError:
+        return False
+
+
+def doctor_checks() -> list[tuple[str, bool, str]]:
+    """(check, ok, exact fix) rows for `pdfcloak sidecar doctor`."""
+    import shutil
+    rows: list[tuple[str, bool, str]] = []
+    binary = find_sidecar_binary()
+    rows.append(("sidecar binary", binary is not None,
+                 "run: pdfcloak sidecar build"))
+    rows.append(("cargo (only needed to build)", shutil.which("cargo") is not None,
+                 "install Rust from https://rustup.rs"))
+    rows.append(("onnxruntime library", find_onnxruntime_lib() is not None,
+                 "uv tool install --with onnxruntime pdfcloak, or set ORT_DYLIB_PATH"))
+    rows.append(("model weights cached", model_cache_present(),
+                 "first AI run downloads ~412 MB from Hugging Face (needs network)"))
+    return rows

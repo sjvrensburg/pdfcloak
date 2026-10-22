@@ -26,9 +26,11 @@ class PageText:
             rect = self.rects[i]
             if rect is None or rect.is_empty:
                 continue
-            if (merged and abs(merged[-1].y0 - rect.y0) < 2.0
-                    and rect.x0 >= merged[-1].x0
-                    and -1.0 <= rect.x0 - merged[-1].x1 < 12.0):
+            # Adjacent on the same line in either writing direction:
+            # LTR chars step right, RTL chars step left.
+            gap = (max(rect.x0 - merged[-1].x1, merged[-1].x0 - rect.x1)
+                   if merged else 99.0)
+            if merged and abs(merged[-1].y0 - rect.y0) < 2.0 and -1.0 <= gap < 12.0:
                 merged[-1] |= rect
             else:
                 merged.append(fitz.Rect(rect))
@@ -70,10 +72,52 @@ class LineItem:
     bbox: fitz.Rect
     chars: list[tuple[str, fitz.Rect | None]] = field(default_factory=list)
     index: int = 0  # content-stream position, used only as a row tie-break
+    direction: tuple[float, float] = (1.0, 0.0)  # rawdict line "dir" vector
+    wmode: int = 0  # rawdict writing mode (0=horizontal, 1=vertical)
 
     @property
     def text(self) -> str:
         return "".join(c for c, _ in self.chars)
+
+    @property
+    def is_vertical(self) -> bool:
+        return self.wmode == 1 or abs(self.direction[1]) > abs(self.direction[0])
+
+    @property
+    def is_rtl(self) -> bool:
+        return self.direction[0] < -0.5
+
+
+def logical_chars(chars: list[tuple[str, "fitz.Rect | None"]],
+                  direction: tuple[float, float],
+                  ) -> list[tuple[str, "fitz.Rect | None"]]:
+    """Return chars in logical (reading) order for a line.
+
+    PyMuPDF reports chars in content-stream order, which for RTL or
+    vertical text may be *visual* order (e.g. an RTL line stored
+    left-to-right, or a vertical column stored bottom-to-top). When the
+    glyph positions run opposite to the writing direction, reverse them
+    so detectors see the text as read; when they already follow the
+    direction, keep stream order untouched.
+    """
+    if len(chars) < 2:
+        return chars
+    dx, dy = direction
+    # Judge monotonicity from glyphs that have a rect; rect-less chars
+    # (rare) must not veto the reversal.
+    if dx < -0.5:  # RTL: logical order runs right-to-left (decreasing x)
+        centres = [(r.x0 + r.x1) / 2 for _, r in chars if r is not None]
+        if len(centres) >= 2 and all(a <= b for a, b in zip(centres, centres[1:])):
+            return list(reversed(chars))
+    elif abs(dy) > abs(dx):  # vertical: logical order follows the dir vector
+        centres = [(r.y0 + r.y1) / 2 for _, r in chars if r is not None]
+        if len(centres) >= 2 and dy < 0 \
+                and all(a <= b for a, b in zip(centres, centres[1:])):
+            return list(reversed(chars))
+        if len(centres) >= 2 and dy > 0 \
+                and all(a >= b for a, b in zip(centres, centres[1:])):
+            return list(reversed(chars))
+    return chars
 
 
 # Reading-order constants ported from RailReaderCore's XYCutPlusPlusResolver
@@ -112,7 +156,9 @@ def _median(values: list[float]) -> float:
 
 
 def _union_length(intervals: list[tuple[float, float]]) -> float:
-    total, cur_s, cur_e = 0.0, None, None
+    total = 0.0
+    cur_s: float | None = None
+    cur_e = 0.0
     for s, e in sorted(intervals):
         if cur_s is None:
             cur_s, cur_e = s, e
@@ -129,7 +175,7 @@ def estimate_line_pitch(lines: list[LineItem]) -> float:
     nearest following line in the same column. Falls back to median height."""
     if len(lines) < 2:
         return max(1.0, lines[0].bbox.height) if lines else 1.0
-    ordered = sorted(lines, key=lambda l: l.bbox.y0)
+    ordered = sorted(lines, key=lambda li: li.bbox.y0)
     pitches: list[float] = []
     for i, a in enumerate(ordered):
         for b in ordered[i + 1:]:
@@ -143,7 +189,7 @@ def estimate_line_pitch(lines: list[LineItem]) -> float:
             break
     if pitches:
         return max(1.0, _median(pitches))
-    return max(1.0, _median([l.bbox.height for l in lines]))
+    return max(1.0, _median([li.bbox.height for li in lines]))
 
 
 def build_blocks(lines: list[LineItem]) -> list[BlockItem]:
@@ -153,7 +199,7 @@ def build_blocks(lines: list[LineItem]) -> list[BlockItem]:
     their own lines (ported from TextLayoutAnalyzer.BuildBlocks)."""
     max_gap = estimate_line_pitch(lines) * _BETWEEN_LINE_MULTIPLIER
     blocks: list[BlockItem] = []
-    for line in sorted(lines, key=lambda l: (l.bbox.y0, l.bbox.x0)):
+    for line in sorted(lines, key=lambda li: (li.bbox.y0, li.bbox.x0)):
         best, best_gap = None, float("inf")
         for block in blocks:
             gap = line.bbox.y0 - block.bbox.y1
@@ -339,7 +385,8 @@ def _pre_mask(blocks: list[BlockItem]) -> tuple[list[BlockItem], list[BlockItem]
         return [], list(blocks)
     med_w = _median([b.bbox.width for b in blocks])
     med_h = _median([b.bbox.height for b in blocks])
-    masked, body = [], []
+    masked: list[BlockItem] = []
+    body: list[BlockItem] = []
     for b in blocks:
         narrow = b.bbox.width <= med_w * _MARGIN_NOTE_WIDTH_FRAC
         margin_note = narrow and any(
@@ -391,18 +438,42 @@ def xy_cut_order(items: list[LineItem]) -> list[LineItem]:
     lines = [i for i in items if i.chars]
     if len(lines) <= 1:
         return lines
+    if all(li.is_vertical for li in lines):
+        # Vertical (e.g. CJK) columns: read top-to-bottom within a column,
+        # columns right-to-left.
+        return sorted(lines, key=lambda li: (-li.bbox.x0, li.bbox.y0))
+    if any(li.is_rtl for li in lines):
+        # Mirror x and reuse the LTR machinery: RTL columns then read
+        # right-to-left with rows top-to-bottom.
+        mirrored = [LineItem(
+            bbox=fitz.Rect(-li.bbox.x1, li.bbox.y0, -li.bbox.x0, li.bbox.y1),
+            chars=li.chars, index=li.index, direction=li.direction,
+            wmode=li.wmode) for li in lines]
+        by_id = {id(m): o for m, o in zip(mirrored, lines)}
+        return [by_id[id(m)] for block in order_blocks(build_blocks(mirrored))
+                for m in sorted(block.lines,
+                                key=lambda li: (li.bbox.y0, li.bbox.x0))]
     ordered: list[LineItem] = []
     for block in order_blocks(build_blocks(lines)):
-        ordered += sorted(block.lines, key=lambda l: (l.bbox.y0, l.bbox.x0))
+        ordered += sorted(block.lines, key=_within_block_key)
     return ordered
+
+
+def _within_block_key(li: LineItem) -> tuple[float, float]:
+    if li.is_vertical:
+        return (-li.bbox.x0, li.bbox.y0)
+    return (li.bbox.y0, li.bbox.x0)
 
 
 def extract_page(page: fitz.Page, page_index: int) -> PageText:
     out = PageText(page=page_index)
     out.has_images = bool(page.get_images(full=True))
+    # Accumulate in a list and join once: per-char `text += ch` is O(n^2)
+    # string copying on large pages.
+    chars: list[str] = []
 
     def emit_char(ch: str, rect: fitz.Rect | None) -> None:
-        out.text += ch
+        chars.append(ch)
         out.rects.append(rect)
         if rect is not None:
             out.char_count += 1
@@ -412,14 +483,19 @@ def extract_page(page: fitz.Page, page_index: int) -> PageText:
         if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
-            item = LineItem(bbox=fitz.Rect(line["bbox"]), index=len(lines))
+            direction = tuple(float(v) for v in line.get("dir", (1.0, 0.0)))
+            item = LineItem(bbox=fitz.Rect(line["bbox"]), index=len(lines),
+                            direction=(direction[0], direction[1]),
+                            wmode=int(line.get("wmode", 0)))
+            raw_chars: list[tuple[str, fitz.Rect | None]] = []
             for span in line.get("spans", []):
                 for char in span.get("chars", []):
                     c = char.get("c", "")
                     if not c:
                         continue
                     bbox = char.get("bbox")
-                    item.chars.append((c, fitz.Rect(bbox) if bbox else None))
+                    raw_chars.append((c, fitz.Rect(bbox) if bbox else None))
+            item.chars = logical_chars(raw_chars, item.direction)
             if item.chars:
                 lines.append(item)
     for li, item in enumerate(xy_cut_order(lines)):
@@ -427,6 +503,7 @@ def extract_page(page: fitz.Page, page_index: int) -> PageText:
             emit_char("\n", None)
         for ch, rect in item.chars:
             emit_char(ch, rect)
+    out.text = "".join(chars)
     return out
 
 

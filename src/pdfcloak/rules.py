@@ -74,9 +74,14 @@ def load_rules_file(path: str | Path | None) -> list[Rule]:
 
 
 def built_in_rules() -> list[Rule]:
-    """Sensible defaults used when the user supplies no rules at all."""
+    """Sensible defaults. Always active unless --no-builtins is passed.
+
+    The email pattern is Unicode-aware (the `regex` module's ``\\w`` covers
+    accented/Cyrillic/CJK local parts and IDN domains), so non-English
+    addresses are not silently missed by an ASCII-only character class.
+    """
     return [
-        Rule("email", r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"),
+        Rule("email", r"[\w.+-]+@[^\W_]+(?:-[^\W_]+)*(?:\.[^\W_]+(?:-[^\W_]+)*)*\.[A-Za-z]{2,}"),
         Rule("url", r"https?://[^\s<>()\[\]]+"),
         Rule("ipv4", r"\b(?:\d{1,3}\.){3}\d{1,3}\b"),
     ]

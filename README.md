@@ -113,7 +113,14 @@ pdfcloak redact in.pdf -o out.pdf --rules rules.toml
 ```
 
 Regex matches take priority over AI matches.
-Reports list a short hash of each match, not the text itself.
+Your `--regex`/`--rules` rules are *added to* the built-in email/url/ipv4
+rules — they never silently replace them. Pass `--no-builtins` if you really
+only want your own rules. pdfcloak prints the active rule list when you pass
+custom rules.
+
+Reports never print matched text. Each match carries a masked glimpse
+(`j***@e***.com`) so you can triage without leaking the value. Set
+`PDFCLOAK_REPORT_HMAC_KEY` if you need a keyed digest for audit matching.
 Add `--show-matches` only if you really need to see the matched text.
 
 ### Limit the pages
@@ -130,15 +137,60 @@ Useful forms: `all`, `3`, `3-7`, `3-`, `-7`, `1,4,last`.
 ### Other options
 
 - `--replacement label` writes a label such as `[EMAIL]` instead of a
-  black bar. The default is `--replacement black`.
-- `--password <password>` opens an encrypted PDF.
-- `--report report.json` saves the JSON report to a file.
+  black bar. The default is `--replacement black`. Labels are sized to fit
+  the text they replace.
+- `--password <password>` opens an encrypted PDF. Prefer
+  `--password-env VAR` or the `PDFCLOAK_PASSWORD` environment variable:
+  a password on the command line is visible in shell history and process
+  listings. On a terminal, pdfcloak prompts for it instead. Note that the
+  redacted output is *not* re-encrypted.
+- `--report report.json` saves the JSON report to a file (written
+  atomically, owner-only). Reports include counts by label and page;
+  `--limit`/`--offset` page through large reports.
 - `--dry-run` (on `redact`) shows what would be removed without
-  writing a file.
+  writing a file, including a `scrub_preview` of the hidden carriers
+  (metadata, bookmarks, attachments, annotations, form fields, links)
+  that scrubbing would delete.
+- `--preview preview.pdf` (on `redact`) writes an annotated copy with the
+  matches highlighted, so you can inspect before anything is deleted.
+- `--exclude-labels url` (on `redact`) leaves matches with those labels
+  in place. `--interactive` asks for confirmation on a terminal first.
+- `--fail-on-findings` (on `scan`) exits 3 when matches — or pages that
+  could not be checked — are found.
+- `--quiet` silences progress and summaries (stdout JSON is unaffected);
+  `--verbose` lists the detectors and active rules.
+- `--max-pages N` / `--max-mb N` refuse oversized inputs instead of
+  running out of memory on them.
+
+While it works, pdfcloak prints page progress and a one-line summary
+(`found: 3 match(es) (email=2, sa_id=1)`) to stderr, plus the suggested
+next command. Existing outputs are replaced atomically — a crash never
+leaves a half-written file — and a file that fails verification is moved
+to `<output>.unsafe` instead of sitting at the path you meant to share.
 
 `redact` also strips hidden carriers of personal data on every page:
 document metadata, attachments, annotations, form fields, link targets,
 and bookmarks. Text on pages outside `--pages` is left as it is.
+
+### Scanned PDFs, folders, and a local web page
+
+- `pdfcloak ocr in.pdf -o ocr.pdf` adds a text layer to a scanned PDF
+  (needs [ocrmypdf](https://ocrmypdf.readthedocs.io) on PATH; pdfcloak
+  itself has no OCR engine). Redact the OCR'd file afterwards.
+- `pdfcloak batch scan <dir>` / `pdfcloak batch redact <dir> -o <outdir>`
+  processes every PDF in a folder and prints one JSON summary.
+- `--profile gdpr|hipaa|legal|sa|minimal` bundles labels, extra rules, and
+  (for hipaa) a threshold for a policy context. It is a starting point,
+  not a compliance guarantee; your own rules and `--labels` still merge in.
+- `--lang af|de` translates the human verdict lines (the JSON report is
+  unchanged). Page progress and detector names stay as they are.
+- `pdfcloak serve` starts a small web page at http://127.0.0.1:8765 for
+  scanning or redacting one PDF in the browser. It is loopback-only and
+  has no authentication — do not expose it to a network.
+
+Reading order honours right-to-left and vertical text: RTL lines are
+normalised to logical order, vertical columns read top-to-bottom,
+right-to-left, and redaction boxes merge in either writing direction.
 
 ## AI detection (optional)
 
@@ -153,7 +205,13 @@ uv tool install --with onnxruntime git+https://github.com/sjvrensburg/pdfcloak
 # already installed with pipx? use: pipx inject pdfcloak onnxruntime
 pdfcloak sidecar build     # needs Rust; builds the detector binary
 pdfcloak sidecar status    # check that everything is in place
+pdfcloak sidecar doctor    # preflight: binary, onnxruntime, model cache,
+                           # with the exact fix for anything missing
 ```
+
+`sidecar doctor` exits non-zero when the AI detector is not ready, so it
+can gate a setup script. (`sidecar status` stays informational and always
+exits 0.)
 
 Then add `--detector clipcloak` to any command:
 
@@ -172,7 +230,10 @@ in the sidecar log just mean it fell back to CPU.
 - `scan` — report what would be found. Never modifies the PDF.
 - `redact` — remove the matches, clean hidden data, save, and verify.
 - `verify` — re-check a redacted PDF.
-- `sidecar build|status` — build and inspect the optional AI detector.
+- `ocr` — add a text layer to a scanned PDF (needs ocrmypdf).
+- `batch scan|redact` — process every PDF in a directory.
+- `serve` — local web page for one-off scans/redactions.
+- `sidecar build|status|doctor` — build, inspect, or preflight the AI detector.
 
 Exit codes tell scripts what happened:
 
@@ -184,7 +245,8 @@ Exit codes tell scripts what happened:
 
 ## Limits
 
-- No OCR yet. Scanned, image-only pages are flagged in the report.
+- No built-in OCR. Scanned, image-only pages are flagged in the report;
+  use `pdfcloak ocr` (ocrmypdf) to add a text layer first.
   `verify` and `redact` exit `3` for them so you do not share a file
   that was never checked. `--allow-scanned` accepts that risk.
 - Matches cannot span a page break.
